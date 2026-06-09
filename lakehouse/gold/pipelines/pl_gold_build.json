@@ -1,0 +1,284 @@
+{
+  "name": "pl_gold_build",
+  "properties": {
+    "description": "Gold layer build pipeline. Constructs fact tables, aggregates, refreshes Synapse views, and notifies downstream consumers on success.",
+    "parameters": {
+      "batch_id": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "process_date": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "logic_app_webhook_url": {
+        "type": "string",
+        "defaultValue": ""
+      }
+    },
+    "variables": {
+      "pipeline_status": {
+        "type": "String",
+        "defaultValue": "running"
+      },
+      "notification_payload": {
+        "type": "String",
+        "defaultValue": ""
+      }
+    },
+    "activities": [
+      {
+        "name": "nb_build_fact_transactions",
+        "description": "Builds the gold-layer fact_transactions table from silver, applying business rules, SCD logic, and surrogate key generation.",
+        "type": "ExecuteNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.04:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebook": {
+            "referenceName": "gld_build_fact_transactions",
+            "type": "NotebookReference"
+          },
+          "parameters": {
+            "batch_id": {
+              "value": {
+                "value": "@pipeline().parameters.batch_id",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "process_date": {
+              "value": {
+                "value": "@pipeline().parameters.process_date",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "silver_transactions_path": {
+              "value": "abfss://silver@{linkedService().storageAccountName}.dfs.core.windows.net/transactions/",
+              "type": "string"
+            },
+            "gold_path": {
+              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/fact_transactions/",
+              "type": "string"
+            }
+          },
+          "sparkPool": {
+            "referenceName": "sparkPoolSmall",
+            "type": "BigDataPoolReference"
+          },
+          "executorSize": "Medium",
+          "conf": {
+            "spark.dynamicAllocation.enabled": true,
+            "spark.dynamicAllocation.minExecutors": 3,
+            "spark.dynamicAllocation.maxExecutors": 10
+          },
+          "numExecutors": 4
+        }
+      },
+      {
+        "name": "nb_build_aggregates",
+        "description": "Builds daily/hourly aggregate tables from the fact_transactions gold layer for BI and AI model feature consumption.",
+        "type": "ExecuteNotebook",
+        "dependsOn": [
+          {
+            "activity": "nb_build_fact_transactions",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.02:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebook": {
+            "referenceName": "gld_build_aggregates",
+            "type": "NotebookReference"
+          },
+          "parameters": {
+            "batch_id": {
+              "value": {
+                "value": "@pipeline().parameters.batch_id",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "process_date": {
+              "value": {
+                "value": "@pipeline().parameters.process_date",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "gold_fact_path": {
+              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/fact_transactions/",
+              "type": "string"
+            },
+            "gold_aggregates_path": {
+              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/aggregates/",
+              "type": "string"
+            }
+          },
+          "sparkPool": {
+            "referenceName": "sparkPoolSmall",
+            "type": "BigDataPoolReference"
+          },
+          "executorSize": "Small",
+          "conf": {
+            "spark.dynamicAllocation.enabled": true,
+            "spark.dynamicAllocation.minExecutors": 2,
+            "spark.dynamicAllocation.maxExecutors": 6
+          },
+          "numExecutors": 3
+        }
+      },
+      {
+        "name": "scr_refresh_synapse_views",
+        "description": "Executes stored procedure to refresh Synapse external tables and materialized views pointing at the gold ADLS layer.",
+        "type": "Script",
+        "dependsOn": [
+          {
+            "activity": "nb_build_aggregates",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:30:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "linkedService": {
+            "referenceName": "ls_synapse_sql_dedicated",
+            "type": "LinkedServiceReference"
+          },
+          "scripts": [
+            {
+              "type": "NonQuery",
+              "text": {
+                "value": "EXEC dbo.usp_refresh_gold_external_tables\n    @process_date = '@{pipeline().parameters.process_date}',\n    @batch_id     = '@{pipeline().parameters.batch_id}';",
+                "type": "Expression"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "set_pipeline_status_success",
+        "description": "Marks the pipeline status variable as success before sending the notification.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "scr_refresh_synapse_views",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "pipeline_status",
+          "value": "success"
+        }
+      },
+      {
+        "name": "web_notify_success",
+        "description": "POSTs a structured JSON payload to the Logic App webhook URL to notify downstream consumers that the gold layer is ready.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "set_pipeline_status_success",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"SUCCESS\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"completed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build completed successfully.\"}'))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "web_notify_failure",
+        "description": "POSTs a failure notification to the Logic App webhook if any upstream activity fails.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "nb_build_fact_transactions",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          },
+          {
+            "activity": "nb_build_aggregates",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          },
+          {
+            "activity": "scr_refresh_synapse_views",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"FAILED\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build FAILED. Check Azure Synapse monitoring for run ID: ', pipeline().RunId, '\"}'))",
+            "type": "Expression"
+          }
+        }
+      }
+    ],
+    "annotations": [
+      "layer:gold",
+      "domain:banking",
+      "platform:ai-log-analytics"
+    ]
+  }
+}

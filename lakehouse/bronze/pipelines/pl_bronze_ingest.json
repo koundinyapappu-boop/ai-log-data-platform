@@ -1,0 +1,383 @@
+{
+  "name": "pl_bronze_ingest",
+  "properties": {
+    "description": "Bronze layer ingestion pipeline for banking AI log analytics. Reads watermark, ingests raw logs via notebook, updates control table.",
+    "parameters": {
+      "batch_id": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "ingestion_date": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "source_system": {
+        "type": "string",
+        "defaultValue": "banking_ai_logs"
+      }
+    },
+    "variables": {
+      "pipeline_status": {
+        "type": "String",
+        "defaultValue": "running"
+      },
+      "error_message": {
+        "type": "String",
+        "defaultValue": ""
+      }
+    },
+    "activities": [
+      {
+        "name": "lkp_get_watermark",
+        "description": "Reads the last successful watermark from the pipeline control table in Synapse SQL.",
+        "type": "Lookup",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.00:05:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "source": {
+            "type": "SqlDWSource",
+            "sqlReaderQuery": "SELECT TOP 1\n    pipeline_name,\n    last_watermark_value,\n    last_successful_run,\n    source_system\nFROM dbo.pipeline_control_table\nWHERE pipeline_name = 'pl_bronze_ingest'\n  AND source_system = '@{pipeline().parameters.source_system}'\nORDER BY last_successful_run DESC",
+            "queryTimeout": "00:02:00",
+            "partitionOption": "None"
+          },
+          "dataset": {
+            "referenceName": "ds_synapse_sql_control_table",
+            "type": "DatasetReference"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "if_watermark_found",
+        "description": "Checks whether a watermark record exists; branches to ingest or to first-run path.",
+        "type": "IfCondition",
+        "dependsOn": [
+          {
+            "activity": "lkp_get_watermark",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@not(empty(activity('lkp_get_watermark').output))",
+            "type": "Expression"
+          },
+          "ifTrueActivities": [
+            {
+              "name": "nb_ingest_logs",
+              "description": "Executes the bronze ingestion notebook with batch parameters and watermark context.",
+              "type": "ExecuteNotebook",
+              "dependsOn": [],
+              "policy": {
+                "timeout": "0.02:00:00",
+                "retry": 1,
+                "retryIntervalInSeconds": 60,
+                "secureOutput": false,
+                "secureInput": false
+              },
+              "typeProperties": {
+                "notebook": {
+                  "referenceName": "brz_ingest_logs",
+                  "type": "NotebookReference"
+                },
+                "parameters": {
+                  "batch_id": {
+                    "value": {
+                      "value": "@pipeline().parameters.batch_id",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "ingestion_date": {
+                    "value": {
+                      "value": "@pipeline().parameters.ingestion_date",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "source_system": {
+                    "value": {
+                      "value": "@pipeline().parameters.source_system",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "last_watermark": {
+                    "value": {
+                      "value": "@activity('lkp_get_watermark').output.firstRow.last_watermark_value",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  }
+                },
+                "sparkPool": {
+                  "referenceName": "sparkPoolSmall",
+                  "type": "BigDataPoolReference"
+                },
+                "executorSize": "Small",
+                "conf": {
+                  "spark.dynamicAllocation.enabled": false,
+                  "spark.dynamicAllocation.minExecutors": 2,
+                  "spark.dynamicAllocation.maxExecutors": 5
+                },
+                "numExecutors": 2
+              }
+            },
+            {
+              "name": "sp_update_watermark",
+              "description": "Updates the control table with the new watermark after successful notebook execution.",
+              "type": "SqlServerStoredProcedure",
+              "dependsOn": [
+                {
+                  "activity": "nb_ingest_logs",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "policy": {
+                "timeout": "0.00:05:00",
+                "retry": 2,
+                "retryIntervalInSeconds": 30,
+                "secureOutput": false,
+                "secureInput": false
+              },
+              "typeProperties": {
+                "storedProcedureName": "dbo.usp_update_pipeline_watermark",
+                "storedProcedureParameters": {
+                  "pipeline_name": {
+                    "value": "pl_bronze_ingest",
+                    "type": "String"
+                  },
+                  "batch_id": {
+                    "value": {
+                      "value": "@pipeline().parameters.batch_id",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "new_watermark_value": {
+                    "value": {
+                      "value": "@pipeline().parameters.ingestion_date",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "source_system": {
+                    "value": {
+                      "value": "@pipeline().parameters.source_system",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "run_status": {
+                    "value": "SUCCESS",
+                    "type": "String"
+                  }
+                }
+              },
+              "linkedServiceName": {
+                "referenceName": "ls_synapse_sql_dedicated",
+                "type": "LinkedServiceReference"
+              }
+            },
+            {
+              "name": "sp_log_ingest_failure",
+              "description": "Logs failure details to the control table when notebook execution fails.",
+              "type": "SqlServerStoredProcedure",
+              "dependsOn": [
+                {
+                  "activity": "nb_ingest_logs",
+                  "dependencyConditions": [
+                    "Failed"
+                  ]
+                }
+              ],
+              "policy": {
+                "timeout": "0.00:05:00",
+                "retry": 1,
+                "retryIntervalInSeconds": 30,
+                "secureOutput": false,
+                "secureInput": false
+              },
+              "typeProperties": {
+                "storedProcedureName": "dbo.usp_update_pipeline_watermark",
+                "storedProcedureParameters": {
+                  "pipeline_name": {
+                    "value": "pl_bronze_ingest",
+                    "type": "String"
+                  },
+                  "batch_id": {
+                    "value": {
+                      "value": "@pipeline().parameters.batch_id",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "new_watermark_value": {
+                    "value": {
+                      "value": "@pipeline().parameters.ingestion_date",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "source_system": {
+                    "value": {
+                      "value": "@pipeline().parameters.source_system",
+                      "type": "Expression"
+                    },
+                    "type": "String"
+                  },
+                  "run_status": {
+                    "value": "FAILED",
+                    "type": "String"
+                  }
+                }
+              },
+              "linkedServiceName": {
+                "referenceName": "ls_synapse_sql_dedicated",
+                "type": "LinkedServiceReference"
+              }
+            },
+            {
+              "name": "ep_notify_failure",
+              "description": "Triggers the failure notification pipeline if notebook ingestion fails.",
+              "type": "ExecutePipeline",
+              "dependsOn": [
+                {
+                  "activity": "sp_log_ingest_failure",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "pipeline": {
+                  "referenceName": "pl_failure_handler",
+                  "type": "PipelineReference"
+                },
+                "waitOnCompletion": false,
+                "parameters": {
+                  "failed_pipeline": {
+                    "value": "pl_bronze_ingest",
+                    "type": "Expression"
+                  },
+                  "batch_id": {
+                    "value": "@pipeline().parameters.batch_id",
+                    "type": "Expression"
+                  },
+                  "error_message": {
+                    "value": "@activity('nb_ingest_logs').output.status.messages",
+                    "type": "Expression"
+                  }
+                }
+              }
+            }
+          ],
+          "ifFalseActivities": [
+            {
+              "name": "nb_ingest_logs_first_run",
+              "description": "First-run path: executes ingestion notebook with no prior watermark.",
+              "type": "ExecuteNotebook",
+              "dependsOn": [],
+              "policy": {
+                "timeout": "0.02:00:00",
+                "retry": 1,
+                "retryIntervalInSeconds": 60,
+                "secureOutput": false,
+                "secureInput": false
+              },
+              "typeProperties": {
+                "notebook": {
+                  "referenceName": "brz_ingest_logs",
+                  "type": "NotebookReference"
+                },
+                "parameters": {
+                  "batch_id": {
+                    "value": {
+                      "value": "@pipeline().parameters.batch_id",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "ingestion_date": {
+                    "value": {
+                      "value": "@pipeline().parameters.ingestion_date",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "source_system": {
+                    "value": {
+                      "value": "@pipeline().parameters.source_system",
+                      "type": "Expression"
+                    },
+                    "type": "string"
+                  },
+                  "last_watermark": {
+                    "value": "1970-01-01T00:00:00Z",
+                    "type": "string"
+                  }
+                },
+                "sparkPool": {
+                  "referenceName": "sparkPoolSmall",
+                  "type": "BigDataPoolReference"
+                },
+                "executorSize": "Small",
+                "numExecutors": 2
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "name": "trg_bronze_ingest_15min",
+        "properties": {
+          "type": "ScheduleTrigger",
+          "typeProperties": {
+            "recurrence": {
+              "frequency": "Minute",
+              "interval": 15,
+              "startTime": "2024-01-01T00:00:00Z",
+              "timeZone": "UTC"
+            }
+          },
+          "pipelines": [
+            {
+              "pipelineReference": {
+                "referenceName": "pl_bronze_ingest",
+                "type": "PipelineReference"
+              },
+              "parameters": {
+                "batch_id": {
+                  "value": "@formatDateTime(trigger().scheduledTime, 'yyyyMMddHHmm')",
+                  "type": "Expression"
+                },
+                "ingestion_date": {
+                  "value": "@formatDateTime(trigger().scheduledTime, 'yyyy-MM-ddTHH:mm:ssZ')",
+                  "type": "Expression"
+                },
+                "source_system": "banking_ai_logs"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "annotations": [
+      "layer:bronze",
+      "domain:banking",
+      "platform:ai-log-analytics"
+    ]
+  }
+}

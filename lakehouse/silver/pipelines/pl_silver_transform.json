@@ -1,0 +1,259 @@
+{
+  "name": "pl_silver_transform",
+  "properties": {
+    "description": "Silver layer transformation pipeline. Transforms raw bronze logs into cleansed silver tables for transactions and authentication events, then validates row counts.",
+    "parameters": {
+      "batch_id": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "process_date": {
+        "type": "string",
+        "defaultValue": ""
+      }
+    },
+    "variables": {
+      "pipeline_status": {
+        "type": "String",
+        "defaultValue": "running"
+      },
+      "transactions_row_count": {
+        "type": "Integer",
+        "defaultValue": 0
+      },
+      "auth_row_count": {
+        "type": "Integer",
+        "defaultValue": 0
+      },
+      "validation_passed": {
+        "type": "Boolean",
+        "defaultValue": false
+      }
+    },
+    "activities": [
+      {
+        "name": "nb_transform_transactions",
+        "description": "Transforms raw transaction logs from bronze to silver. Applies schema enforcement, deduplication, and PII masking.",
+        "type": "ExecuteNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.03:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebook": {
+            "referenceName": "slv_transform_transactions",
+            "type": "NotebookReference"
+          },
+          "parameters": {
+            "batch_id": {
+              "value": {
+                "value": "@pipeline().parameters.batch_id",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "process_date": {
+              "value": {
+                "value": "@pipeline().parameters.process_date",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "bronze_path": {
+              "value": "abfss://bronze@{linkedService().storageAccountName}.dfs.core.windows.net/banking_ai_logs/transactions/",
+              "type": "string"
+            },
+            "silver_path": {
+              "value": "abfss://silver@{linkedService().storageAccountName}.dfs.core.windows.net/transactions/",
+              "type": "string"
+            }
+          },
+          "sparkPool": {
+            "referenceName": "sparkPoolSmall",
+            "type": "BigDataPoolReference"
+          },
+          "executorSize": "Small",
+          "conf": {
+            "spark.dynamicAllocation.enabled": true,
+            "spark.dynamicAllocation.minExecutors": 2,
+            "spark.dynamicAllocation.maxExecutors": 8
+          },
+          "numExecutors": 3
+        }
+      },
+      {
+        "name": "nb_transform_auth",
+        "description": "Transforms authentication event logs from bronze to silver in parallel with transaction transformation.",
+        "type": "ExecuteNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.03:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebook": {
+            "referenceName": "slv_transform_auth",
+            "type": "NotebookReference"
+          },
+          "parameters": {
+            "batch_id": {
+              "value": {
+                "value": "@pipeline().parameters.batch_id",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "process_date": {
+              "value": {
+                "value": "@pipeline().parameters.process_date",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "bronze_path": {
+              "value": "abfss://bronze@{linkedService().storageAccountName}.dfs.core.windows.net/banking_ai_logs/auth/",
+              "type": "string"
+            },
+            "silver_path": {
+              "value": "abfss://silver@{linkedService().storageAccountName}.dfs.core.windows.net/auth_events/",
+              "type": "string"
+            }
+          },
+          "sparkPool": {
+            "referenceName": "sparkPoolSmall",
+            "type": "BigDataPoolReference"
+          },
+          "executorSize": "Small",
+          "conf": {
+            "spark.dynamicAllocation.enabled": true,
+            "spark.dynamicAllocation.minExecutors": 2,
+            "spark.dynamicAllocation.maxExecutors": 8
+          },
+          "numExecutors": 3
+        }
+      },
+      {
+        "name": "scr_validate_silver",
+        "description": "Runs COUNT(*) quality checks on both silver tables; fails the pipeline if either count is 0, indicating no data was written.",
+        "type": "Script",
+        "dependsOn": [
+          {
+            "activity": "nb_transform_transactions",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          },
+          {
+            "activity": "nb_transform_auth",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:10:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 30,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "linkedService": {
+            "referenceName": "ls_synapse_sql_dedicated",
+            "type": "LinkedServiceReference"
+          },
+          "scripts": [
+            {
+              "type": "Query",
+              "text": {
+                "value": "DECLARE @transactions_count BIGINT;\nDECLARE @auth_count BIGINT;\nDECLARE @batch_id NVARCHAR(100) = '@{pipeline().parameters.batch_id}';\nDECLARE @process_date DATE = '@{pipeline().parameters.process_date}';\n\nSELECT @transactions_count = COUNT(*)\nFROM silver.transactions\nWHERE batch_id = @batch_id\n  AND CAST(process_date AS DATE) = @process_date;\n\nSELECT @auth_count = COUNT(*)\nFROM silver.auth_events\nWHERE batch_id = @batch_id\n  AND CAST(process_date AS DATE) = @process_date;\n\nIF @transactions_count = 0\nBEGIN\n    RAISERROR('Silver validation FAILED: transactions table has 0 rows for batch_id=%s, process_date=%s', 16, 1, @batch_id, @process_date);\nEND\n\nIF @auth_count = 0\nBEGIN\n    RAISERROR('Silver validation FAILED: auth_events table has 0 rows for batch_id=%s, process_date=%s', 16, 1, @batch_id, @process_date);\nEND\n\nSELECT\n    @batch_id        AS batch_id,\n    @process_date    AS process_date,\n    @transactions_count AS transactions_row_count,\n    @auth_count      AS auth_row_count,\n    'PASSED'         AS validation_status;",
+                "type": "Expression"
+              }
+            }
+          ],
+          "logSettings": {
+            "linkedService": {
+              "referenceName": "ls_synapse_sql_dedicated",
+              "type": "LinkedServiceReference"
+            }
+          }
+        }
+      },
+      {
+        "name": "set_transactions_row_count",
+        "description": "Captures the validated transactions row count into a pipeline variable for downstream use.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "scr_validate_silver",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "transactions_row_count",
+          "value": {
+            "value": "@activity('scr_validate_silver').output.resultSets[0].rows[0].transactions_row_count",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "set_auth_row_count",
+        "description": "Captures the validated authentication events row count into a pipeline variable.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "scr_validate_silver",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "auth_row_count",
+          "value": {
+            "value": "@activity('scr_validate_silver').output.resultSets[0].rows[0].auth_row_count",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "set_pipeline_status_success",
+        "description": "Sets the pipeline status variable to SUCCESS after all activities complete.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "set_transactions_row_count",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          },
+          {
+            "activity": "set_auth_row_count",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "pipeline_status",
+          "value": "success"
+        }
+      }
+    ],
+    "annotations": [
+      "layer:silver",
+      "domain:banking",
+      "platform:ai-log-analytics"
+    ]
+  }
+}
