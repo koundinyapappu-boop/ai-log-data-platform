@@ -1,7 +1,7 @@
 {
   "name": "pl_gold_build",
   "properties": {
-    "description": "Gold layer build pipeline. Constructs fact tables, aggregates, refreshes Synapse views, and notifies downstream consumers on success.",
+    "description": "Gold layer build pipeline for the banking AI log analytics platform. Builds the fact_transactions Delta table, then builds daily and hourly aggregates that depend on it. After both notebooks succeed, refreshes Synapse external tables and materialized views via a stored procedure. On success POSTs a structured JSON payload to a Logic App webhook; on any upstream failure POSTs an alert payload to the same endpoint.",
     "parameters": {
       "batch_id": {
         "type": "string",
@@ -19,7 +19,7 @@
     "variables": {
       "pipeline_status": {
         "type": "String",
-        "defaultValue": "running"
+        "defaultValue": "RUNNING"
       },
       "notification_payload": {
         "type": "String",
@@ -29,7 +29,7 @@
     "activities": [
       {
         "name": "nb_build_fact_transactions",
-        "description": "Builds the gold-layer fact_transactions table from silver, applying business rules, SCD logic, and surrogate key generation.",
+        "description": "Executes gld_build_fact_transactions notebook. Applies business rules, SCD Type 2 logic, and surrogate key generation to the silver transactions Delta table, writing the result to gold/fact_transactions. This is the entry-point activity with no upstream dependencies.",
         "type": "ExecuteNotebook",
         "dependsOn": [],
         "policy": {
@@ -59,15 +59,24 @@
               },
               "type": "string"
             },
-            "silver_transactions_path": {
-              "value": "abfss://silver@{linkedService().storageAccountName}.dfs.core.windows.net/transactions/",
+            "silver_container": {
+              "value": "silver",
               "type": "string"
             },
-            "gold_path": {
-              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/fact_transactions/",
+            "gold_container": {
+              "value": "gold",
+              "type": "string"
+            },
+            "source_table": {
+              "value": "transactions",
+              "type": "string"
+            },
+            "target_table": {
+              "value": "fact_transactions",
               "type": "string"
             }
           },
+          "snapshot": true,
           "sparkPool": {
             "referenceName": "sparkPoolSmall",
             "type": "BigDataPoolReference"
@@ -83,7 +92,7 @@
       },
       {
         "name": "nb_build_aggregates",
-        "description": "Builds daily/hourly aggregate tables from the fact_transactions gold layer for BI and AI model feature consumption.",
+        "description": "Executes gld_build_aggregates notebook after fact_transactions is ready. Computes daily and hourly aggregate tables (transaction volumes, anomaly scores, model feature vectors) from the fact layer for BI dashboards and AI model consumption.",
         "type": "ExecuteNotebook",
         "dependsOn": [
           {
@@ -120,15 +129,20 @@
               },
               "type": "string"
             },
-            "gold_fact_path": {
-              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/fact_transactions/",
+            "gold_container": {
+              "value": "gold",
               "type": "string"
             },
-            "gold_aggregates_path": {
-              "value": "abfss://gold@{linkedService().storageAccountName}.dfs.core.windows.net/aggregates/",
+            "fact_table": {
+              "value": "fact_transactions",
+              "type": "string"
+            },
+            "aggregates_table": {
+              "value": "aggregates",
               "type": "string"
             }
           },
+          "snapshot": true,
           "sparkPool": {
             "referenceName": "sparkPoolSmall",
             "type": "BigDataPoolReference"
@@ -144,7 +158,7 @@
       },
       {
         "name": "scr_refresh_synapse_views",
-        "description": "Executes stored procedure to refresh Synapse external tables and materialized views pointing at the gold ADLS layer.",
+        "description": "Calls dbo.usp_refresh_gold_external_tables stored procedure to rebuild Synapse Analytics external tables and update materialized views pointing at the refreshed gold ADLS Gen2 layer. Runs after both gold notebooks succeed.",
         "type": "Script",
         "dependsOn": [
           {
@@ -170,7 +184,7 @@
             {
               "type": "NonQuery",
               "text": {
-                "value": "EXEC dbo.usp_refresh_gold_external_tables\n    @process_date = '@{pipeline().parameters.process_date}',\n    @batch_id     = '@{pipeline().parameters.batch_id}';",
+                "value": "EXEC [dbo].[usp_refresh_gold_external_tables]\n    @process_date = '@{pipeline().parameters.process_date}',\n    @batch_id     = '@{pipeline().parameters.batch_id}';",
                 "type": "Expression"
               }
             }
@@ -179,7 +193,7 @@
       },
       {
         "name": "set_pipeline_status_success",
-        "description": "Marks the pipeline status variable as success before sending the notification.",
+        "description": "Sets the pipeline_status variable to SUCCESS immediately after view refresh completes. Used by the success notification activity.",
         "type": "SetVariable",
         "dependsOn": [
           {
@@ -191,12 +205,12 @@
         ],
         "typeProperties": {
           "variableName": "pipeline_status",
-          "value": "success"
+          "value": "SUCCESS"
         }
       },
       {
         "name": "web_notify_success",
-        "description": "POSTs a structured JSON payload to the Logic App webhook URL to notify downstream consumers that the gold layer is ready.",
+        "description": "POSTs a structured JSON payload to the Logic App webhook URL on successful pipeline completion. The payload includes pipeline name, batch_id, process_date, pipeline run ID, and UTC completion timestamp for downstream consumer coordination.",
         "type": "WebActivity",
         "dependsOn": [
           {
@@ -223,14 +237,14 @@
             "Content-Type": "application/json"
           },
           "body": {
-            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"SUCCESS\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"completed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build completed successfully.\"}'))",
+            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"SUCCESS\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"completed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build completed successfully. Downstream BI and AI consumers may now query the gold layer.\"}'))",
             "type": "Expression"
           }
         }
       },
       {
         "name": "web_notify_failure",
-        "description": "POSTs a failure notification to the Logic App webhook if any upstream activity fails.",
+        "description": "POSTs a failure alert to the Logic App webhook if nb_build_fact_transactions, nb_build_aggregates, or scr_refresh_synapse_views fails. Fires on any of those three activities entering a Failed state so no error is silently dropped.",
         "type": "WebActivity",
         "dependsOn": [
           {
@@ -269,7 +283,7 @@
             "Content-Type": "application/json"
           },
           "body": {
-            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"FAILED\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build FAILED. Check Azure Synapse monitoring for run ID: ', pipeline().RunId, '\"}'))",
+            "value": "@json(concat('{\"pipeline_name\":\"pl_gold_build\",\"status\":\"FAILED\",\"batch_id\":\"', pipeline().parameters.batch_id, '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"pipeline_run_id\":\"', pipeline().RunId, '\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Gold layer build FAILED. Inspect Synapse Monitor for run ID: ', pipeline().RunId, '. Gold data may be stale.\"}'))",
             "type": "Expression"
           }
         }
@@ -279,6 +293,9 @@
       "layer:gold",
       "domain:banking",
       "platform:ai-log-analytics"
-    ]
+    ],
+    "folder": {
+      "name": "lakehouse/gold"
+    }
   }
 }

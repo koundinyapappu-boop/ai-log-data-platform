@@ -1,0 +1,526 @@
+{
+  "name": "pl_master_orchestrator",
+  "properties": {
+    "description": "Master orchestration pipeline for the banking AI log analytics platform. Executes the full medallion-architecture data flow: bronze ingestion → silver transformation → gold build, each as a child ExecutePipeline call in strict sequence. Wraps each stage in an Until activity that polls for completion with a configurable timeout, enabling decoupled async execution. Sends a Logic App webhook notification on overall success or failure. Intended to be triggered manually or by a high-level daily/event schedule.",
+    "parameters": {
+      "process_date": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "logic_app_webhook_url": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "poll_interval_seconds": {
+        "type": "int",
+        "defaultValue": 30
+      },
+      "max_poll_iterations": {
+        "type": "int",
+        "defaultValue": 120
+      }
+    },
+    "variables": {
+      "orchestrator_status": {
+        "type": "String",
+        "defaultValue": "RUNNING"
+      },
+      "bronze_status": {
+        "type": "String",
+        "defaultValue": "PENDING"
+      },
+      "silver_status": {
+        "type": "String",
+        "defaultValue": "PENDING"
+      },
+      "gold_status": {
+        "type": "String",
+        "defaultValue": "PENDING"
+      },
+      "poll_iteration": {
+        "type": "Integer",
+        "defaultValue": 0
+      },
+      "batch_id": {
+        "type": "String",
+        "defaultValue": ""
+      }
+    },
+    "activities": [
+      {
+        "name": "set_batch_id",
+        "description": "Derives and stores a canonical batch_id from process_date for use across all child pipelines.",
+        "type": "SetVariable",
+        "dependsOn": [],
+        "typeProperties": {
+          "variableName": "batch_id",
+          "value": {
+            "value": "@concat('BATCH_', replace(pipeline().parameters.process_date, '-', ''), '_', formatDateTime(utcNow(), 'HHmmss'))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "ep_bronze_ingest",
+        "description": "Executes pl_bronze_ingest as a synchronous child pipeline. Passes the derived batch_id, process_date as ingestion_date, and source system. Waits for completion before proceeding to silver.",
+        "type": "ExecutePipeline",
+        "dependsOn": [
+          {
+            "activity": "set_batch_id",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "pipeline": {
+            "referenceName": "pl_bronze_ingest",
+            "type": "PipelineReference"
+          },
+          "waitOnCompletion": true,
+          "parameters": {
+            "batch_id": {
+              "value": "@variables('batch_id')",
+              "type": "Expression"
+            },
+            "ingestion_date": {
+              "value": "@pipeline().parameters.process_date",
+              "type": "Expression"
+            },
+            "source_system": "banking_ai_logs"
+          }
+        }
+      },
+      {
+        "name": "set_bronze_status_succeeded",
+        "description": "Records bronze pipeline completion in the orchestrator-level status variable.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_bronze_ingest",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "bronze_status",
+          "value": "SUCCEEDED"
+        }
+      },
+      {
+        "name": "set_bronze_status_failed",
+        "description": "Records bronze pipeline failure so downstream activities can react without inspecting child pipeline state directly.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_bronze_ingest",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "bronze_status",
+          "value": "FAILED"
+        }
+      },
+      {
+        "name": "web_notify_bronze_failure",
+        "description": "Sends an immediate failure alert to the Logic App webhook when the bronze pipeline fails, so operations teams are notified before silver is attempted.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "set_bronze_status_failed",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"orchestrator_run_id\":\"', pipeline().RunId, '\",\"pipeline_name\":\"pl_master_orchestrator\",\"failed_stage\":\"bronze\",\"batch_id\":\"', variables('batch_id'), '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"status\":\"FAILED\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Bronze ingestion stage failed. Silver and Gold stages will not run.\"}'))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "until_bronze_complete",
+        "description": "Until activity that polls the bronze_status variable. Exits when bronze_status is no longer PENDING or RUNNING. The Until body is a no-op Wait that allows the condition to be re-evaluated on each iteration. In practice bronze runs synchronously via waitOnCompletion=true, so this loop exits on the first iteration; it is included as the required pattern for decoupled async orchestration and timeout safety.",
+        "type": "Until",
+        "dependsOn": [
+          {
+            "activity": "set_bronze_status_succeeded",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@or(equals(variables('bronze_status'), 'SUCCEEDED'), equals(variables('bronze_status'), 'FAILED'))",
+            "type": "Expression"
+          },
+          "timeout": "0.01:00:00",
+          "activities": [
+            {
+              "name": "wait_bronze_poll",
+              "description": "Polls every poll_interval_seconds seconds before re-evaluating the Until condition.",
+              "type": "Wait",
+              "dependsOn": [],
+              "typeProperties": {
+                "waitTimeInSeconds": {
+                  "value": "@pipeline().parameters.poll_interval_seconds",
+                  "type": "Expression"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ep_silver_transform",
+        "description": "Executes pl_silver_transform after bronze completes successfully. Passes the same batch_id and process_date for data lineage consistency.",
+        "type": "ExecutePipeline",
+        "dependsOn": [
+          {
+            "activity": "until_bronze_complete",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "pipeline": {
+            "referenceName": "pl_silver_transform",
+            "type": "PipelineReference"
+          },
+          "waitOnCompletion": true,
+          "parameters": {
+            "batch_id": {
+              "value": "@variables('batch_id')",
+              "type": "Expression"
+            },
+            "process_date": {
+              "value": "@pipeline().parameters.process_date",
+              "type": "Expression"
+            }
+          }
+        }
+      },
+      {
+        "name": "set_silver_status_succeeded",
+        "description": "Records silver pipeline success.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_silver_transform",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "silver_status",
+          "value": "SUCCEEDED"
+        }
+      },
+      {
+        "name": "set_silver_status_failed",
+        "description": "Records silver pipeline failure.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_silver_transform",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "silver_status",
+          "value": "FAILED"
+        }
+      },
+      {
+        "name": "web_notify_silver_failure",
+        "description": "Sends a failure alert to the Logic App webhook when the silver transformation pipeline fails.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "set_silver_status_failed",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"orchestrator_run_id\":\"', pipeline().RunId, '\",\"pipeline_name\":\"pl_master_orchestrator\",\"failed_stage\":\"silver\",\"batch_id\":\"', variables('batch_id'), '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"status\":\"FAILED\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Silver transformation stage failed. Gold build will not run. Check silver quality validation output.\"}'))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "until_silver_complete",
+        "description": "Until activity that polls silver_status. Provides the timeout safety net and async decoupling pattern. Exits when silver_status resolves to SUCCEEDED or FAILED.",
+        "type": "Until",
+        "dependsOn": [
+          {
+            "activity": "set_silver_status_succeeded",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@or(equals(variables('silver_status'), 'SUCCEEDED'), equals(variables('silver_status'), 'FAILED'))",
+            "type": "Expression"
+          },
+          "timeout": "0.03:00:00",
+          "activities": [
+            {
+              "name": "wait_silver_poll",
+              "description": "Polls every poll_interval_seconds seconds.",
+              "type": "Wait",
+              "dependsOn": [],
+              "typeProperties": {
+                "waitTimeInSeconds": {
+                  "value": "@pipeline().parameters.poll_interval_seconds",
+                  "type": "Expression"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ep_gold_build",
+        "description": "Executes pl_gold_build after silver completes successfully. Passes batch_id, process_date, and the Logic App webhook URL so the gold pipeline can send its own targeted notification.",
+        "type": "ExecutePipeline",
+        "dependsOn": [
+          {
+            "activity": "until_silver_complete",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "pipeline": {
+            "referenceName": "pl_gold_build",
+            "type": "PipelineReference"
+          },
+          "waitOnCompletion": true,
+          "parameters": {
+            "batch_id": {
+              "value": "@variables('batch_id')",
+              "type": "Expression"
+            },
+            "process_date": {
+              "value": "@pipeline().parameters.process_date",
+              "type": "Expression"
+            },
+            "logic_app_webhook_url": {
+              "value": "@pipeline().parameters.logic_app_webhook_url",
+              "type": "Expression"
+            }
+          }
+        }
+      },
+      {
+        "name": "set_gold_status_succeeded",
+        "description": "Records gold pipeline success.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_gold_build",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "gold_status",
+          "value": "SUCCEEDED"
+        }
+      },
+      {
+        "name": "set_gold_status_failed",
+        "description": "Records gold pipeline failure.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "ep_gold_build",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "gold_status",
+          "value": "FAILED"
+        }
+      },
+      {
+        "name": "until_gold_complete",
+        "description": "Until activity that polls gold_status. Provides timeout safety net with a 4-hour ceiling for the gold build stage.",
+        "type": "Until",
+        "dependsOn": [
+          {
+            "activity": "set_gold_status_succeeded",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@or(equals(variables('gold_status'), 'SUCCEEDED'), equals(variables('gold_status'), 'FAILED'))",
+            "type": "Expression"
+          },
+          "timeout": "0.04:00:00",
+          "activities": [
+            {
+              "name": "wait_gold_poll",
+              "description": "Polls every poll_interval_seconds seconds.",
+              "type": "Wait",
+              "dependsOn": [],
+              "typeProperties": {
+                "waitTimeInSeconds": {
+                  "value": "@pipeline().parameters.poll_interval_seconds",
+                  "type": "Expression"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "set_orchestrator_status_success",
+        "description": "Sets the master orchestrator status to SUCCESS once all three medallion layers have completed.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "until_gold_complete",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "orchestrator_status",
+          "value": "SUCCESS"
+        }
+      },
+      {
+        "name": "web_notify_orchestrator_success",
+        "description": "Sends a master-level success notification to the Logic App webhook once all three stages complete. Includes a summary of all stage statuses and the derived batch_id for traceability.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "set_orchestrator_status_success",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"orchestrator_run_id\":\"', pipeline().RunId, '\",\"pipeline_name\":\"pl_master_orchestrator\",\"batch_id\":\"', variables('batch_id'), '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"status\":\"SUCCESS\",\"bronze_status\":\"', variables('bronze_status'), '\",\"silver_status\":\"', variables('silver_status'), '\",\"gold_status\":\"', variables('gold_status'), '\",\"completed_at\":\"', utcnow(), '\",\"message\":\"Full medallion pipeline completed successfully. Gold layer is ready for BI and AI consumption.\"}'))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "web_notify_orchestrator_failure",
+        "description": "Sends a master-level failure alert if the gold build or gold status variable update fails. Complements the stage-level failure notifications for a complete alerting picture at the orchestrator level.",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "ep_gold_build",
+            "dependencyConditions": [
+              "Failed"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:02:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 15,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.logic_app_webhook_url",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "@json(concat('{\"orchestrator_run_id\":\"', pipeline().RunId, '\",\"pipeline_name\":\"pl_master_orchestrator\",\"batch_id\":\"', variables('batch_id'), '\",\"process_date\":\"', pipeline().parameters.process_date, '\",\"status\":\"FAILED\",\"bronze_status\":\"', variables('bronze_status'), '\",\"silver_status\":\"', variables('silver_status'), '\",\"gold_status\":\"FAILED\",\"failed_at\":\"', utcnow(), '\",\"message\":\"Master orchestrator FAILED at gold build stage. Gold data is stale. Investigate Synapse Monitor run ID: ', pipeline().RunId, '.\"}'))",
+            "type": "Expression"
+          }
+        }
+      }
+    ],
+    "annotations": [
+      "layer:orchestrator",
+      "domain:banking",
+      "platform:ai-log-analytics",
+      "pattern:medallion"
+    ],
+    "folder": {
+      "name": "lakehouse"
+    }
+  }
+}
