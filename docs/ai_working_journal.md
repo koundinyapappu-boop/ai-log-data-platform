@@ -7,13 +7,6 @@
 
 ---
 
-## Journal Format
-Each entry follows the pattern:
-> **Prompt** — what was asked (one line)  
-> **Outcome** — what was delivered
-
----
-
 ## Step 1 — Project Structure & Architecture
 
 **Prompt:** "Build a simple AI Log Analytics platform. Create only the project structure and architecture. Do not generate code yet."
